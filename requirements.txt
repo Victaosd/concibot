@@ -4,3 +4,4 @@ openai
 pdfplumber
 openpyxl
 plotly
+pymupdf

@@ -3,6 +3,7 @@ import json
 import re
 from typing import List, Dict, Optional
 
+import fitz  # PyMuPDF
 import pandas as pd
 import pdfplumber
 import plotly.express as px
@@ -21,7 +22,7 @@ st.set_page_config(
 
 
 # ---------------------------------------
-# Constantes e texto do sistema para a IA
+# Constantes e textos de sistema para a IA
 # ---------------------------------------
 SYSTEM_PROMPT = (
     "Você é um assistente contábil brasileiro especializado em classificação de "
@@ -30,6 +31,18 @@ SYSTEM_PROMPT = (
     "Transferência, ou Revisar (quando não tiver certeza). Retorne apenas um JSON "
     "com array de objetos contendo: data, descricao, valor, categoria, confianca "
     "(alta/media/baixa)."
+)
+
+EXTRACTION_SYSTEM_PROMPT = (
+    "Você é um assistente contábil brasileiro especializado em extrair "
+    "lançamentos bancários de textos de extratos de bancos brasileiros "
+    "(Nubank, Itaú, Bradesco, Santander, Banco do Brasil, Caixa, etc.). "
+    "Sua tarefa é identificar todos os lançamentos contendo: data, descrição "
+    "e valor (positivo para créditos, negativo para débitos). "
+    "Retorne apenas um JSON com o campo 'lancamentos', que é um array de objetos "
+    "no formato: {data, descricao, valor}. A data deve estar em um formato "
+    "reconhecível (por exemplo, dd/mm/aaaa) e o valor deve ser um número decimal "
+    "com ponto ou vírgula como separador decimal."
 )
 
 
@@ -103,29 +116,17 @@ def parse_csv_file(uploaded_file) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def parse_pdf_file(uploaded_file) -> pd.DataFrame:
+def extract_transactions_from_lines(text_lines: List[str]) -> pd.DataFrame:
     """
-    Extrai lançamentos de um extrato em PDF.
+    Tenta extrair lançamentos a partir de linhas de texto usando expressões regulares.
 
-    Observação: o formato de extratos em PDF varia muito entre bancos. Aqui
-    usamos uma heurística simples baseada em linhas contendo:
-    DATA DESCRICAO VALOR
-    Exemplo: 01/02/2025 COMPRA SUPERMERCADO -123,45
+    Projetado para lidar com formatos comuns de extratos brasileiros, como:
+    01/02/2025 COMPRA SUPERMERCADO -123,45
+    01-02-2025 TED RECEBIDA 1.234,56
     """
-    text_lines: List[str] = []
-    with pdfplumber.open(uploaded_file) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if not text:
-                continue
-            for raw_line in text.splitlines():
-                line = raw_line.strip()
-                if line:
-                    text_lines.append(line)
-
-    # Regex simples: data (dd/mm/aaaa ou dd-mm-aaaa), descrição no meio e valor no final
+    # Data (dd/mm/aaaa ou dd-mm-aaaa), descrição no meio e valor no final
     pattern = re.compile(
-        r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\s+(.+?)\s+(-?\d+[\.\d]*,\d{2}|-?\d+\.\d{2})$"
+        r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\s+(.+?)\s+(-?\d+[\.\d]*,\d{2}|-?\d+,\d{2}|-?\d+\.\d{2})$"
     )
 
     records: List[Dict] = []
@@ -144,27 +145,203 @@ def parse_pdf_file(uploaded_file) -> pd.DataFrame:
             }
         )
 
-    if not records:
-        raise ValueError(
-            "Não foi possível extrair lançamentos do PDF automaticamente. "
-            "O layout pode ser diferente do esperado."
-        )
-
     df = pd.DataFrame(records)
     df = df.dropna(subset=["data", "descricao", "valor"])
     return df.reset_index(drop=True)
 
 
+def extract_text_lines_with_pdfplumber(file_bytes: bytes) -> List[str]:
+    """Extrai linhas de texto de um PDF usando pdfplumber."""
+    text_lines: List[str] = []
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if not text:
+                continue
+            for raw_line in text.splitlines():
+                line = raw_line.strip()
+                if line:
+                    text_lines.append(line)
+    return text_lines
+
+
+def extract_text_lines_with_pymupdf(file_bytes: bytes) -> List[str]:
+    """Extrai linhas de texto de um PDF usando PyMuPDF (fitz)."""
+    text_lines: List[str] = []
+    with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+        for page in doc:
+            text = page.get_text("text")
+            if not text:
+                continue
+            for raw_line in text.splitlines():
+                line = raw_line.strip()
+                if line:
+                    text_lines.append(line)
+    return text_lines
+
+
+def extract_full_text_from_pdf(file_bytes: bytes) -> str:
+    """
+    Extrai texto bruto do PDF, tentando primeiro PyMuPDF e depois pdfplumber.
+    Útil para enviar o texto completo para a OpenAI quando o layout é complexo.
+    """
+    # Primeiro tenta PyMuPDF (geralmente mais robusto para Nubank e outros)
+    try:
+        texts: List[str] = []
+        with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+            for page in doc:
+                t = page.get_text("text")
+                if t:
+                    texts.append(t)
+        if texts:
+            return "\n".join(texts)
+    except Exception:
+        pass
+
+    # Fallback para pdfplumber
+    try:
+        texts = []
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t:
+                    texts.append(t)
+        if texts:
+            return "\n".join(texts)
+    except Exception:
+        pass
+
+    return ""
+
+
+def extract_transactions_with_openai_from_text(text: str) -> pd.DataFrame:
+    """
+    Usa o modelo da OpenAI para extrair lançamentos (data, descrição, valor)
+    a partir do texto bruto de um extrato bancário.
+    """
+    if not text.strip():
+        raise ValueError("Texto do PDF vazio, não é possível extrair lançamentos.")
+
+    client = get_openai_client()
+
+    # Limita o tamanho do texto para evitar estouro de contexto em PDFs muito grandes
+    max_chars = 50000
+    trimmed_text = text[:max_chars]
+
+    user_prompt = (
+        "A seguir está o texto completo (ou parte) de um extrato bancário brasileiro. "
+        "Identifique todos os lançamentos bancários presentes, extraindo para cada um: "
+        "data, descrição e valor (positivo para créditos, negativo para débitos). "
+        "IMPORTANTE: retorne SOMENTE um JSON no formato:\n"
+        '{"lancamentos": [{"data": "...", "descricao": "...", "valor": 0.0}, ...]}\n\n'
+        "Texto do extrato:\n"
+        f"{trimmed_text}"
+    )
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0,
+    )
+
+    content = response.choices[0].message.content
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        raise ValueError(
+            "A resposta da OpenAI para extração não pôde ser interpretada como JSON."
+        )
+
+    lancamentos_resp = data.get("lancamentos", data)
+    if not isinstance(lancamentos_resp, list):
+        raise ValueError(
+            "O JSON retornado pela OpenAI para extração não contém um array de lançamentos válido."
+        )
+
+    records: List[Dict] = []
+    for item in lancamentos_resp:
+        raw_date = item.get("data")
+        raw_desc = item.get("descricao")
+        raw_valor = item.get("valor")
+
+        date_str = normalize_date(raw_date) or str(raw_date)
+        valor = parse_brazilian_number(raw_valor)
+
+        records.append(
+            {
+                "data": date_str,
+                "descricao": str(raw_desc).strip() if raw_desc is not None else "",
+                "valor": valor,
+            }
+        )
+
+    df = pd.DataFrame(records)
+    df = df.dropna(subset=["data", "descricao", "valor"])
+    if df.empty:
+        raise ValueError(
+            "A OpenAI não conseguiu extrair lançamentos válidos do texto do extrato."
+        )
+
+    return df.reset_index(drop=True)
+
+
 def load_statement(uploaded_file) -> pd.DataFrame:
-    """Detecta tipo do arquivo e delega para o parser apropriado."""
+    """
+    Detecta tipo do arquivo e delega para o parser apropriado.
+
+    Para PDF, aplica uma lógica em cascata:
+    1) Tenta extrair com pdfplumber
+    2) Se falhar, tenta com PyMuPDF (fitz)
+    3) Se ainda falhar, extrai o texto bruto e usa a OpenAI para identificar lançamentos
+    """
     if uploaded_file is None:
         raise ValueError("Nenhum arquivo enviado.")
 
     name = uploaded_file.name.lower()
+
     if name.endswith(".csv"):
         return parse_csv_file(uploaded_file)
+
     if name.endswith(".pdf"):
-        return parse_pdf_file(uploaded_file)
+        # Lê o conteúdo do arquivo em memória para reutilizar nas diferentes estratégias
+        file_bytes = uploaded_file.read()
+
+        # 1) pdfplumber
+        try:
+            lines = extract_text_lines_with_pdfplumber(file_bytes)
+            df_pdfplumber = extract_transactions_from_lines(lines)
+            if not df_pdfplumber.empty:
+                return df_pdfplumber
+        except Exception:
+            pass
+
+        # 2) PyMuPDF (fitz)
+        try:
+            lines = extract_text_lines_with_pymupdf(file_bytes)
+            df_pymupdf = extract_transactions_from_lines(lines)
+            if not df_pymupdf.empty:
+                return df_pymupdf
+        except Exception:
+            pass
+
+        # 3) OpenAI: extrai texto bruto e pede para a IA identificar lançamentos
+        try:
+            raw_text = extract_full_text_from_pdf(file_bytes)
+            if not raw_text.strip():
+                raise ValueError("Texto do PDF vazio, não é possível usar OpenAI.")
+
+            df_ai = extract_transactions_with_openai_from_text(raw_text)
+            if not df_ai.empty:
+                return df_ai
+        except Exception as e:
+            raise ValueError(
+                "Não foi possível extrair lançamentos do PDF, mesmo após tentar pdfplumber, "
+                "PyMuPDF e OpenAI. Verifique se o extrato está legível e tente novamente."
+            ) from e
 
     raise ValueError("Tipo de arquivo não suportado. Use PDF ou CSV.")
 
@@ -172,14 +349,24 @@ def load_statement(uploaded_file) -> pd.DataFrame:
 # -----------------------------------
 # Funções de integração com a OpenAI
 # -----------------------------------
-def get_openai_client(api_key: str) -> OpenAI:
-    """Cria cliente da OpenAI com a API key informada pelo usuário."""
+def get_openai_client() -> OpenAI:
+    """
+    Cria cliente da OpenAI usando a chave armazenada em st.secrets["OPENAI_API_KEY"].
+
+    A chave não deve aparecer na interface, apenas ser configurada via secrets.
+    """
+    try:
+        api_key = st.secrets["OPENAI_API_KEY"]
+    except Exception as e:
+        raise ValueError(
+            "OPENAI_API_KEY não encontrada em st.secrets. "
+            "Defina-a em .streamlit/secrets.toml ou nas configurações de implantação."
+        ) from e
+
     return OpenAI(api_key=api_key)
 
 
-def classify_transactions_with_openai(
-    df: pd.DataFrame, api_key: str
-) -> pd.DataFrame:
+def classify_transactions_with_openai(df: pd.DataFrame) -> pd.DataFrame:
     """
     Envia os lançamentos para o modelo gpt-4o-mini para classificação.
 
@@ -190,7 +377,7 @@ def classify_transactions_with_openai(
     if df.empty:
         raise ValueError("Não há lançamentos para classificar.")
 
-    client = get_openai_client(api_key)
+    client = get_openai_client()
 
     lancamentos = []
     for _, row in df.iterrows():
@@ -321,24 +508,14 @@ def plot_category_summary(df: pd.DataFrame):
 # Interface principal Streamlit
 # -----------------------------
 def main():
-    # Barra lateral para configurações
-    st.sidebar.title("Configurações")
-    st.sidebar.markdown(
-        "Informe sua chave da OpenAI para usar o ConciBot.\n\n"
-        "Sua chave **não** é armazenada no servidor."
-    )
-    api_key = st.sidebar.text_input("OpenAI API Key", type="password")
-
-    st.sidebar.markdown("---")
+    # Barra lateral apenas com upload de arquivo, sem menção a configurações ou chave
+    st.sidebar.title("ConciBot")
     uploaded_file = st.sidebar.file_uploader(
-        "Envie o extrato bancário (PDF ou CSV)", type=["pdf", "csv"]
+        "Faça upload do seu extrato bancário em PDF ou CSV", type=["pdf", "csv"]
     )
 
     st.title("ConciBot 🧾")
-    st.markdown(
-        "Aplicação para **classificar automaticamente lançamentos bancários** usando IA "
-        "(modelo `gpt-4o-mini`)."
-    )
+    st.markdown("Faça upload do seu extrato bancário em PDF ou CSV.")
 
     # Estado da sessão para armazenar dados entre interações
     if "raw_df" not in st.session_state:
@@ -371,20 +548,17 @@ def main():
     if st.session_state.raw_df is not None:
         st.markdown("### Classificação com IA")
 
-        if not api_key:
-            st.warning("Informe sua OpenAI API Key para habilitar a classificação.")
-        else:
-            if st.button("Classificar lançamentos com IA", type="primary"):
-                with st.spinner("Enviando lançamentos para a OpenAI..."):
-                    try:
-                        classified_df = classify_transactions_with_openai(
-                            st.session_state.raw_df, api_key
-                        )
-                        st.session_state.classified_df = classified_df
-                        st.session_state.edited_df = classified_df.copy()
-                        st.success("Classificação concluída com sucesso!")
-                    except Exception as e:
-                        st.error(f"Erro ao classificar lançamentos: {e}")
+        if st.button("Classificar lançamentos com IA", type="primary"):
+            with st.spinner("Enviando lançamentos para a OpenAI..."):
+                try:
+                    classified_df = classify_transactions_with_openai(
+                        st.session_state.raw_df
+                    )
+                    st.session_state.classified_df = classified_df
+                    st.session_state.edited_df = classified_df.copy()
+                    st.success("Classificação concluída com sucesso!")
+                except Exception as e:
+                    st.error(f"Erro ao classificar lançamentos: {e}")
 
     # ---------------------------------
     # Etapa 3: visualização e edição
