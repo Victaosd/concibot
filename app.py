@@ -1,14 +1,16 @@
+import base64
 import io
 import json
 import re
 from typing import List, Dict, Optional
 
-import fitz  # PyMuPDF
 import pandas as pd
 import pdfplumber
 import plotly.express as px
 import streamlit as st
 from openai import OpenAI
+from pdf2image import convert_from_bytes
+from PIL import Image
 
 
 # -----------------------------
@@ -77,141 +79,201 @@ def normalize_date(value) -> Optional[str]:
         return None
 
 
-def find_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    """Encontra coluna aproximada com base em palavras-chave (case-insensitive)."""
-    lower_map = {col: col.lower() for col in df.columns}
-    for target in candidates:
-        for col, lower in lower_map.items():
-            if target in lower:
-                return col
-    return None
+def try_detect_date_column(df: pd.DataFrame) -> Optional[str]:
+    """Tenta identificar automaticamente a coluna de data em um DataFrame genérico."""
+    date_keywords = [
+        "data",
+        "date",
+        "dt",
+        "transaction date",
+        "posting date",
+        "fecha",
+        "fechamento",
+    ]
+    best_col = None
+    best_score = 0.0
+
+    for col in df.columns:
+        series = df[col].dropna().astype(str)
+        if series.empty:
+            continue
+        sample = series.head(100)
+        valid_count = sample.apply(lambda v: normalize_date(v) is not None).sum()
+        ratio = valid_count / len(sample)
+
+        name = str(col).lower()
+        if any(k in name for k in date_keywords):
+            ratio += 0.2  # pequeno bônus por palavra-chave no nome
+
+        if ratio > best_score and ratio >= 0.5:
+            best_score = ratio
+            best_col = col
+
+    return best_col
 
 
-def parse_csv_file(uploaded_file) -> pd.DataFrame:
-    """Lê arquivos CSV de extrato bancário em diferentes formatações comuns."""
-    # Tentativa com separador ';' (comum em bancos brasileiros)
-    try:
-        df = pd.read_csv(uploaded_file, sep=";", encoding="latin-1")
-    except Exception:
-        uploaded_file.seek(0)
-        df = pd.read_csv(uploaded_file)
+def try_detect_value_columns(df: pd.DataFrame) -> Dict[str, Optional[str]]:
+    """
+    Tenta identificar automaticamente coluna(s) de valor.
 
-    # Procura colunas típicas de extrato (data, descrição, valor)
-    data_col = find_column(df, ["data"])
-    desc_col = find_column(df, ["descri", "hist", "lança", "histor"])
-    valor_col = find_column(df, ["valor", "val"])
+    Retorna dicionário com chaves:
+      - "single": nome de coluna única com o valor, OU
+      - "debit" e "credit": nomes de colunas separadas (débito/crédito)
+    """
+    value_keywords = ["valor", "value", "amount", "quantia", "total"]
+    debit_keywords = ["deb", "déb", "saída", "saida", "pago", "pagamento"]
+    credit_keywords = ["cred", "créd", "entrada", "receb", "receita"]
 
-    if not all([data_col, desc_col, valor_col]):
-        raise ValueError(
-            "Não foi possível identificar automaticamente as colunas de data, "
-            "descrição e valor no CSV."
-        )
+    numeric_candidates: List[Dict] = []
+
+    for col in df.columns:
+        series = df[col]
+        sample = series.dropna().astype(str).head(100)
+        if sample.empty:
+            continue
+        parsed = sample.apply(lambda v: parse_brazilian_number(v) is not None).sum()
+        ratio = parsed / len(sample)
+        if ratio < 0.6:
+            continue
+        name = str(col).lower()
+        score = ratio
+        if any(k in name for k in value_keywords):
+            score += 0.2
+        numeric_candidates.append({"col": col, "score": score, "name": name})
+
+    if not numeric_candidates:
+        return {"single": None, "debit": None, "credit": None}
+
+    # Ordena por score decrescente
+    numeric_candidates.sort(key=lambda x: x["score"], reverse=True)
+
+    # Caso simples: apenas uma coluna boa de valor
+    if len(numeric_candidates) == 1:
+        return {
+            "single": numeric_candidates[0]["col"],
+            "debit": None,
+            "credit": None,
+        }
+
+    # Caso: possíveis colunas de débito e crédito
+    debit_col = None
+    credit_col = None
+    for cand in numeric_candidates[:3]:
+        if debit_col is None and any(k in cand["name"] for k in debit_keywords):
+            debit_col = cand["col"]
+        if credit_col is None and any(k in cand["name"] for k in credit_keywords):
+            credit_col = cand["col"]
+
+    if debit_col or credit_col:
+        return {"single": None, "debit": debit_col, "credit": credit_col}
+
+    # fallback: pega a melhor coluna como valor único
+    return {
+        "single": numeric_candidates[0]["col"],
+        "debit": None,
+        "credit": None,
+    }
+
+
+def try_detect_description_column(
+    df: pd.DataFrame, exclude: List[str]
+) -> Optional[str]:
+    """Tenta identificar automaticamente a coluna de descrição (texto)."""
+    desc_keywords = [
+        "descri",
+        "hist",
+        "lança",
+        "histor",
+        "memo",
+        "description",
+        "detalhe",
+        "details",
+    ]
+    best_col = None
+    best_score = 0.0
+
+    for col in df.columns:
+        if col in exclude:
+            continue
+        series = df[col]
+        sample = series.dropna().astype(str).head(100)
+        if sample.empty:
+            continue
+        # Queremos colunas predominantemente textuais
+        numeric_like = sample.apply(
+            lambda v: parse_brazilian_number(v) is not None
+        ).sum()
+        numeric_ratio = numeric_like / len(sample)
+        if numeric_ratio > 0.3:
+            continue
+
+        name = str(col).lower()
+        score = 1.0 - numeric_ratio
+        if any(k in name for k in desc_keywords):
+            score += 0.2
+
+        if score > best_score:
+            best_score = score
+            best_col = col
+
+    return best_col
+
+
+def normalize_statement_dataframe(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """
+    A partir de um DataFrame genérico, tenta produzir um DataFrame padronizado
+    com colunas: data, descricao, valor.
+    """
+    if df is None or df.empty:
+        return None
+
+    date_col = try_detect_date_column(df)
+    value_info = try_detect_value_columns(df)
+    desc_col = try_detect_description_column(
+        df, exclude=[c for c in [date_col, value_info.get("single")] if c]
+    )
+
+    if date_col is None or desc_col is None or (
+        value_info.get("single") is None
+        and value_info.get("debit") is None
+        and value_info.get("credit") is None
+    ):
+        return None
 
     out = pd.DataFrame()
-    out["data"] = df[data_col].apply(normalize_date)
+    out["data"] = df[date_col].apply(normalize_date)
     out["descricao"] = df[desc_col].astype(str).str.strip()
-    out["valor"] = df[valor_col].apply(parse_brazilian_number)
+
+    if value_info.get("single"):
+        vcol = value_info["single"]
+        out["valor"] = df[vcol].apply(parse_brazilian_number)
+    else:
+        debit_col = value_info.get("debit")
+        credit_col = value_info.get("credit")
+        debit_series = (
+            df[debit_col].apply(parse_brazilian_number) if debit_col else 0.0
+        )
+        credit_series = (
+            df[credit_col].apply(parse_brazilian_number) if credit_col else 0.0
+        )
+        out["valor"] = credit_series.fillna(0.0) - debit_series.fillna(0.0)
 
     out = out.dropna(subset=["data", "descricao", "valor"])
+    if out.empty:
+        return None
+
     return out.reset_index(drop=True)
 
 
-def extract_transactions_from_lines(text_lines: List[str]) -> pd.DataFrame:
-    """
-    Tenta extrair lançamentos a partir de linhas de texto usando expressões regulares.
-
-    Projetado para lidar com formatos comuns de extratos brasileiros, como:
-    01/02/2025 COMPRA SUPERMERCADO -123,45
-    01-02-2025 TED RECEBIDA 1.234,56
-    """
-    # Data (dd/mm/aaaa ou dd-mm-aaaa), descrição no meio e valor no final
-    pattern = re.compile(
-        r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\s+(.+?)\s+(-?\d+[\.\d]*,\d{2}|-?\d+,\d{2}|-?\d+\.\d{2})$"
-    )
-
-    records: List[Dict] = []
-    for line in text_lines:
-        match = pattern.search(line)
-        if not match:
-            continue
-        raw_date, raw_desc, raw_value = match.groups()
-        date_str = normalize_date(raw_date) or raw_date
-        value = parse_brazilian_number(raw_value)
-        records.append(
-            {
-                "data": date_str,
-                "descricao": raw_desc.strip(),
-                "valor": value,
-            }
-        )
-
-    df = pd.DataFrame(records)
-    df = df.dropna(subset=["data", "descricao", "valor"])
-    return df.reset_index(drop=True)
-
-
-def extract_text_lines_with_pdfplumber(file_bytes: bytes) -> List[str]:
-    """Extrai linhas de texto de um PDF usando pdfplumber."""
-    text_lines: List[str] = []
+def extract_text_from_pdf_with_pdfplumber(file_bytes: bytes) -> str:
+    """Extrai texto bruto de um PDF usando pdfplumber."""
+    texts: List[str] = []
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
-            text = page.extract_text()
-            if not text:
-                continue
-            for raw_line in text.splitlines():
-                line = raw_line.strip()
-                if line:
-                    text_lines.append(line)
-    return text_lines
-
-
-def extract_text_lines_with_pymupdf(file_bytes: bytes) -> List[str]:
-    """Extrai linhas de texto de um PDF usando PyMuPDF (fitz)."""
-    text_lines: List[str] = []
-    with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-        for page in doc:
-            text = page.get_text("text")
-            if not text:
-                continue
-            for raw_line in text.splitlines():
-                line = raw_line.strip()
-                if line:
-                    text_lines.append(line)
-    return text_lines
-
-
-def extract_full_text_from_pdf(file_bytes: bytes) -> str:
-    """
-    Extrai texto bruto do PDF, tentando primeiro PyMuPDF e depois pdfplumber.
-    Útil para enviar o texto completo para a OpenAI quando o layout é complexo.
-    """
-    # Primeiro tenta PyMuPDF (geralmente mais robusto para Nubank e outros)
-    try:
-        texts: List[str] = []
-        with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-            for page in doc:
-                t = page.get_text("text")
-                if t:
-                    texts.append(t)
-        if texts:
-            return "\n".join(texts)
-    except Exception:
-        pass
-
-    # Fallback para pdfplumber
-    try:
-        texts = []
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            for page in pdf.pages:
-                t = page.extract_text()
-                if t:
-                    texts.append(t)
-        if texts:
-            return "\n".join(texts)
-    except Exception:
-        pass
-
-    return ""
+            t = page.extract_text()
+            if t:
+                texts.append(t)
+    return "\n".join(texts)
 
 
 def extract_transactions_with_openai_from_text(text: str) -> pd.DataFrame:
@@ -229,12 +291,12 @@ def extract_transactions_with_openai_from_text(text: str) -> pd.DataFrame:
     trimmed_text = text[:max_chars]
 
     user_prompt = (
-        "A seguir está o texto completo (ou parte) de um extrato bancário brasileiro. "
+        "A seguir está o conteúdo (texto ou CSV) de um extrato bancário brasileiro. "
         "Identifique todos os lançamentos bancários presentes, extraindo para cada um: "
         "data, descrição e valor (positivo para créditos, negativo para débitos). "
         "IMPORTANTE: retorne SOMENTE um JSON no formato:\n"
         '{"lancamentos": [{"data": "...", "descricao": "...", "valor": 0.0}, ...]}\n\n'
-        "Texto do extrato:\n"
+        "Conteúdo do extrato:\n"
         f"{trimmed_text}"
     )
 
@@ -289,6 +351,93 @@ def extract_transactions_with_openai_from_text(text: str) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def extract_transactions_with_openai_from_images(
+    images: List[Image.Image],
+) -> pd.DataFrame:
+    """
+    Usa o modelo de visão da OpenAI (gpt-4o) para extrair lançamentos
+    (data, descrição, valor) a partir de imagens de extratos bancários.
+    """
+    if not images:
+        raise ValueError("Lista de imagens vazia, não é possível extrair lançamentos.")
+
+    client = get_openai_client()
+
+    image_contents = []
+    for img in images:
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        img_bytes = buf.getvalue()
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
+        image_contents.append(
+            {
+                "type": "input_image",
+                "image_url": {"url": f"data:image/png;base64,{b64}"},
+            }
+        )
+
+    user_content = [
+        {
+            "type": "text",
+            "text": (
+                "Extraia todos os lançamentos financeiros dessas imagens de extrato "
+                "bancário brasileiro. Para cada lançamento retorne data, descrição e "
+                "valor em formato JSON no formato:\n"
+                '{"lancamentos": [{"data": "...", "descricao": "...", "valor": 0.0}, ...]}\n\n'
+                "Ignore cabeçalhos, rodapés e informações da conta."
+            ),
+        },
+        *image_contents,
+    ]
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": user_content}],
+        response_format={"type": "json_object"},
+        temperature=0,
+    )
+
+    content = response.choices[0].message.content
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        raise ValueError(
+            "A resposta da OpenAI Vision para extração não pôde ser interpretada como JSON."
+        )
+
+    lancamentos_resp = data.get("lancamentos", data)
+    if not isinstance(lancamentos_resp, list):
+        raise ValueError(
+            "O JSON retornado pela OpenAI Vision não contém um array de lançamentos válido."
+        )
+
+    records: List[Dict] = []
+    for item in lancamentos_resp:
+        raw_date = item.get("data")
+        raw_desc = item.get("descricao")
+        raw_valor = item.get("valor")
+
+        date_str = normalize_date(raw_date) or str(raw_date)
+        valor = parse_brazilian_number(raw_valor)
+
+        records.append(
+            {
+                "data": date_str,
+                "descricao": str(raw_desc).strip() if raw_desc is not None else "",
+                "valor": valor,
+            }
+        )
+
+    df = pd.DataFrame(records)
+    df = df.dropna(subset=["data", "descricao", "valor"])
+    if df.empty:
+        raise ValueError(
+            "A OpenAI Vision não conseguiu extrair lançamentos válidos das imagens do extrato."
+        )
+
+    return df.reset_index(drop=True)
+
+
 def load_statement(uploaded_file) -> pd.DataFrame:
     """
     Detecta tipo do arquivo e delega para o parser apropriado.
@@ -303,45 +452,82 @@ def load_statement(uploaded_file) -> pd.DataFrame:
 
     name = uploaded_file.name.lower()
 
+    # -----------------
+    # Arquivos CSV
+    # -----------------
     if name.endswith(".csv"):
-        return parse_csv_file(uploaded_file)
-
-    if name.endswith(".pdf"):
-        # Lê o conteúdo do arquivo em memória para reutilizar nas diferentes estratégias
         file_bytes = uploaded_file.read()
 
-        # 1) pdfplumber
-        try:
-            lines = extract_text_lines_with_pdfplumber(file_bytes)
-            df_pdfplumber = extract_transactions_from_lines(lines)
-            if not df_pdfplumber.empty:
-                return df_pdfplumber
-        except Exception:
-            pass
+        # 1) Tenta ler com pandas usando diferentes separadores
+        def parse_csv_bytes(b: bytes) -> Optional[pd.DataFrame]:
+            for encoding in ("utf-8", "latin-1"):
+                try:
+                    text = b.decode(encoding)
+                except UnicodeDecodeError:
+                    continue
+                for sep in [",", ";", "\t"]:
+                    try:
+                        df_raw = pd.read_csv(io.StringIO(text), sep=sep)
+                    except Exception:
+                        continue
+                    normalized = normalize_statement_dataframe(df_raw)
+                    if normalized is not None and not normalized.empty:
+                        return normalized
+            return None
 
-        # 2) PyMuPDF (fitz)
-        try:
-            lines = extract_text_lines_with_pymupdf(file_bytes)
-            df_pymupdf = extract_transactions_from_lines(lines)
-            if not df_pymupdf.empty:
-                return df_pymupdf
-        except Exception:
-            pass
+        df_csv = parse_csv_bytes(file_bytes)
+        if df_csv is not None and not df_csv.empty:
+            return df_csv
 
-        # 3) OpenAI: extrai texto bruto e pede para a IA identificar lançamentos
-        try:
-            raw_text = extract_full_text_from_pdf(file_bytes)
-            if not raw_text.strip():
-                raise ValueError("Texto do PDF vazio, não é possível usar OpenAI.")
+        # 2) Fallback: envia o conteúdo bruto do CSV para a OpenAI extrair os lançamentos
+        for encoding in ("utf-8", "latin-1"):
+            try:
+                csv_text = file_bytes.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                csv_text = ""
+        if not csv_text:
+            raise ValueError(
+                "Não foi possível decodificar o CSV nem extrair as colunas automaticamente."
+            )
 
-            df_ai = extract_transactions_with_openai_from_text(raw_text)
-            if not df_ai.empty:
-                return df_ai
+        df_ai_csv = extract_transactions_with_openai_from_text(csv_text)
+        return df_ai_csv
+
+    # -----------------
+    # Arquivos PDF
+    # -----------------
+    if name.endswith(".pdf"):
+        file_bytes = uploaded_file.read()
+
+        # 1) Tenta extrair texto com pdfplumber
+        try:
+            raw_text = extract_text_from_pdf_with_pdfplumber(file_bytes)
+        except Exception as e:
+            raw_text = ""
+
+        if raw_text and len(raw_text) >= 100:
+            # Texto suficiente: usa OpenAI para extrair lançamentos do texto
+            df_ai_pdf_text = extract_transactions_with_openai_from_text(raw_text)
+            return df_ai_pdf_text
+
+        # 2) Possível PDF baseado em imagem: usa pdf2image + OpenAI Vision
+        try:
+            images: List[Image.Image] = convert_from_bytes(file_bytes)
         except Exception as e:
             raise ValueError(
-                "Não foi possível extrair lançamentos do PDF, mesmo após tentar pdfplumber, "
-                "PyMuPDF e OpenAI. Verifique se o extrato está legível e tente novamente."
+                "Não foi possível converter o PDF em imagens. "
+                "Verifique se o arquivo está corrompido ou tente outro extrato."
             ) from e
+
+        if not images:
+            raise ValueError(
+                "Nenhuma página de imagem foi gerada a partir do PDF. "
+                "Não é possível extrair os lançamentos."
+            )
+
+        df_ai_pdf_images = extract_transactions_with_openai_from_images(images)
+        return df_ai_pdf_images
 
     raise ValueError("Tipo de arquivo não suportado. Use PDF ou CSV.")
 
@@ -543,13 +729,14 @@ def main():
         st.info("Envie um extrato bancário em PDF ou CSV na barra lateral para começar.")
 
     # --------------------------------------
-    # Etapa 2: classificação com a OpenAI
+    # Etapa 2: classificação automática com a OpenAI
     # --------------------------------------
     if st.session_state.raw_df is not None:
         st.markdown("### Classificação com IA")
 
-        if st.button("Classificar lançamentos com IA", type="primary"):
-            with st.spinner("Enviando lançamentos para a OpenAI..."):
+        # Classifica automaticamente assim que os dados forem carregados
+        if st.session_state.classified_df is None:
+            with st.spinner("Classificando lançamentos com IA..."):
                 try:
                     classified_df = classify_transactions_with_openai(
                         st.session_state.raw_df
