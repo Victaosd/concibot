@@ -68,6 +68,15 @@ def parse_brazilian_number(value) -> Optional[float]:
         return None
 
 
+def format_brl(amount: float) -> str:
+    """Formata um número float como moeda brasileira (R$ 1.234,56)."""
+    if amount is None or pd.isna(amount):
+        return "R$ 0,00"
+    s = f"{float(amount):,.2f}"
+    s = s.replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"R$ {s}"
+
+
 def normalize_date(value) -> Optional[str]:
     """Converte datas em vários formatos para uma string padronizada AAAA-MM-DD."""
     try:
@@ -380,11 +389,9 @@ def extract_transactions_with_openai_from_images(
         {
             "type": "text",
             "text": (
-                "Extraia todos os lançamentos financeiros dessas imagens de extrato "
-                "bancário brasileiro. Para cada lançamento retorne data, descrição e "
-                "valor em formato JSON no formato:\n"
-                '{"lancamentos": [{"data": "...", "descricao": "...", "valor": 0.0}, ...]}\n\n'
-                "Ignore cabeçalhos, rodapés e informações da conta."
+                "Este é um extrato bancário brasileiro. Extraia todos os lançamentos "
+                "e retorne JSON com array de objetos contendo data (formato DD/MM/YYYY), "
+                "descricao e valor (número positivo para crédito, negativo para débito)."
             ),
         },
         *image_contents,
@@ -641,25 +648,37 @@ def classify_transactions_with_openai(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # -----------------------------
-# Funções de estilo e visual
+# Funções de estilo, resumo e visual
 # -----------------------------
-def highlight_confidence(row: pd.Series):
+def highlight_category(row: pd.Series):
     """
-    Define a cor de fundo da linha de acordo com a confiança:
-    - Verde: Alta
-    - Amarelo: Média
-    - Vermelho: Baixa
+    Define a cor de fundo da linha de acordo com a categoria:
+    - Verde: Receita
+    - Vermelho: Despesa (não Receita, não Transferência, não Revisar)
+    - Amarelo: Revisar
     """
-    conf = str(row.get("confianca", "")).lower()
-    if "alta" in conf:
+    categoria = str(row.get("categoria", "")).lower()
+    if "receita" in categoria:
         color = "#d4edda"  # verde claro
-    elif "méd" in conf or "med" in conf:
+    elif "revisar" in categoria:
         color = "#fff3cd"  # amarelo claro
-    elif "baix" in conf:
-        color = "#f8d7da"  # vermelho claro
+    elif "transfer" in categoria:
+        color = ""  # neutro para transferências
     else:
-        color = ""
+        color = "#f8d7da"  # vermelho claro para demais despesas
     return [f"background-color: {color}" if color else "" for _ in row]
+
+
+def compute_financial_summary(df: pd.DataFrame):
+    """Calcula totais de lançamentos, receitas, despesas e saldo."""
+    if df is None or df.empty:
+        return 0, 0.0, 0.0, 0.0
+
+    total_lanc = len(df)
+    receitas = df.loc[df["valor"] > 0, "valor"].sum()
+    despesas = df.loc[df["valor"] < 0, "valor"].sum()
+    saldo = df["valor"].sum()
+    return total_lanc, float(receitas), float(despesas), float(saldo)
 
 
 def export_to_excel(df: pd.DataFrame) -> bytes:
@@ -670,23 +689,24 @@ def export_to_excel(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-def plot_category_summary(df: pd.DataFrame):
-    """Plota gráfico de barras com total por categoria usando Plotly."""
+def plot_category_pie(df: pd.DataFrame):
+    """Plota gráfico de pizza com distribuição por categoria."""
     if df.empty or "categoria" not in df.columns or "valor" not in df.columns:
         return
 
-    summary = df.groupby("categoria", dropna=False)["valor"].sum().reset_index()
-    summary = summary.sort_values("valor", ascending=False)
-
-    fig = px.bar(
-        summary,
-        x="categoria",
-        y="valor",
-        title="Total por Categoria",
-        labels={"categoria": "Categoria", "valor": "Total (R$)"},
-        text_auto=".2f",
+    summary = (
+        df.assign(valor_abs=df["valor"].abs())
+        .groupby("categoria", dropna=False)["valor_abs"]
+        .sum()
+        .reset_index()
     )
-    fig.update_layout(xaxis_title="Categoria", yaxis_title="Total (R$)")
+
+    fig = px.pie(
+        summary,
+        names="categoria",
+        values="valor_abs",
+        title="Distribuição por categoria",
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -700,8 +720,22 @@ def main():
         "Faça upload do seu extrato bancário em PDF ou CSV", type=["pdf", "csv"]
     )
 
-    st.title("ConciBot 🧾")
+    # Header principal
+    st.markdown(
+        """
+        <div style="text-align: left; margin-bottom: 1rem;">
+            <h1 style="margin-bottom: 0;">📊 ConciBot</h1>
+            <p style="margin-top: 0; color: #555;">
+                Classificação inteligente de extratos bancários
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     st.markdown("Faça upload do seu extrato bancário em PDF ou CSV.")
+
+    # Placeholder para barra de progresso global
+    progress_placeholder = st.empty()
 
     # Estado da sessão para armazenar dados entre interações
     if "raw_df" not in st.session_state:
@@ -716,15 +750,20 @@ def main():
     # ---------------------------
     if uploaded_file is not None:
         try:
-            df = load_statement(uploaded_file)
+            progress = progress_placeholder.progress(10)
+            with st.spinner("Lendo e analisando o extrato..."):
+                df = load_statement(uploaded_file)
+                progress.progress(40)
             st.session_state.raw_df = df
             st.session_state.classified_df = None
             st.session_state.edited_df = None
 
             st.subheader("Lançamentos extraídos")
             st.dataframe(df, use_container_width=True)
+            progress.progress(50)
         except Exception as e:
             st.error(f"Erro ao processar o arquivo: {e}")
+            progress_placeholder.empty()
     else:
         st.info("Envie um extrato bancário em PDF ou CSV na barra lateral para começar.")
 
@@ -736,6 +775,7 @@ def main():
 
         # Classifica automaticamente assim que os dados forem carregados
         if st.session_state.classified_df is None:
+            progress = progress_placeholder.progress(60)
             with st.spinner("Classificando lançamentos com IA..."):
                 try:
                     classified_df = classify_transactions_with_openai(
@@ -743,8 +783,11 @@ def main():
                     )
                     st.session_state.classified_df = classified_df
                     st.session_state.edited_df = classified_df.copy()
+                    progress.progress(100)
+                    progress_placeholder.empty()
                     st.success("Classificação concluída com sucesso!")
                 except Exception as e:
+                    progress_placeholder.empty()
                     st.error(f"Erro ao classificar lançamentos: {e}")
 
     # ---------------------------------
@@ -759,15 +802,37 @@ def main():
             else st.session_state.classified_df
         ).copy()
 
+        # Resumo rápido antes da tabela
+        total_lanc, total_receitas, total_despesas, saldo = compute_financial_summary(
+            current_df
+        )
+        st.markdown(f"**Total de lançamentos encontrados:** {total_lanc}")
+        col_r, col_d = st.columns(2)
+        with col_r:
+            st.markdown(
+                f"**Total de receitas:** "
+                f"<span style='color: green;'>{format_brl(total_receitas)}</span>",
+                unsafe_allow_html=True,
+            )
+        with col_d:
+            st.markdown(
+                f"**Total de despesas:** "
+                f"<span style='color: red;'>{format_brl(abs(total_despesas))}</span>",
+                unsafe_allow_html=True,
+            )
+
         # Tabela colorida por confiança (visual)
-        styled = current_df.style.apply(highlight_confidence, axis=1)
-        st.markdown("**Tabela colorida por nível de confiança:**")
+        display_df = current_df[["data", "descricao", "valor", "categoria"]]
+        styled = display_df.style.apply(highlight_category, axis=1).format(
+            {"valor": format_brl}
+        )
+        st.markdown("**Tabela colorida por categoria:**")
         try:
             # Exibe tabela estática com cores
             st.table(styled)
         except Exception:
             # Se por algum motivo o Styler não funcionar, cai para a tabela simples
-            st.dataframe(current_df, use_container_width=True)
+            st.dataframe(display_df, use_container_width=True)
 
         # Editor interativo para permitir edição de categorias
         st.markdown("**Edite as categorias diretamente na tabela abaixo, se necessário:**")
@@ -775,25 +840,40 @@ def main():
             current_df,
             hide_index=True,
             use_container_width=True,
+            column_order=["data", "descricao", "valor", "categoria"],
             column_config={
                 "data": st.column_config.TextColumn("Data", disabled=True),
                 "descricao": st.column_config.TextColumn("Descrição", disabled=True),
-                "valor": st.column_config.NumberColumn("Valor (R$)", disabled=True),
+                "valor": st.column_config.NumberColumn(
+                    "Valor",
+                    disabled=True,
+                    format="R$ %.2f",
+                ),
                 "categoria": st.column_config.TextColumn("Categoria"),
-                "confianca": st.column_config.TextColumn("Confiança", disabled=True),
             },
             key="editor",
         )
         st.session_state.edited_df = edited_df
 
         # ---------------------------------
-        # Etapa 4: exportação e gráficos
+        # Resumo final: cards e gráfico
         # ---------------------------------
-        st.markdown("### Exportação e resumo")
-        col1, col2 = st.columns(2)
+        if st.session_state.edited_df is not None:
+            total_lanc, total_receitas, total_despesas, saldo = (
+                compute_financial_summary(st.session_state.edited_df)
+            )
 
-        with col1:
-            if st.session_state.edited_df is not None:
+            st.markdown("### Resumo do período")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total de lançamentos", f"{total_lanc}")
+            c2.metric("Total de receitas", format_brl(total_receitas))
+            c3.metric("Total de despesas", format_brl(abs(total_despesas)))
+            c4.metric("Saldo do período", format_brl(saldo))
+
+            st.markdown("### Exportação e gráficos")
+            col1, col2 = st.columns([1, 1])
+
+            with col1:
                 excel_bytes = export_to_excel(st.session_state.edited_df)
                 st.download_button(
                     "Exportar Excel",
@@ -803,12 +883,12 @@ def main():
                         "application/vnd.openxmlformats-officedocument."
                         "spreadsheetml.sheet"
                     ),
+                    type="primary",
                 )
 
-        with col2:
-            if st.session_state.edited_df is not None:
-                st.markdown("**Resumo visual (total por categoria):**")
-                plot_category_summary(st.session_state.edited_df)
+            with col2:
+                st.markdown("**Distribuição por categoria:**")
+                plot_category_pie(st.session_state.edited_df)
 
 
 if __name__ == "__main__":
