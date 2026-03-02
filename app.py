@@ -4,6 +4,7 @@ import json
 import re
 from typing import List, Dict, Optional
 
+import fitz  # PyMuPDF
 import pandas as pd
 import pdfplumber
 import plotly.express as px
@@ -27,12 +28,32 @@ st.set_page_config(
 # Constantes e textos de sistema para a IA
 # ---------------------------------------
 SYSTEM_PROMPT = (
-    "Você é um assistente contábil brasileiro especializado em classificação de "
-    "lançamentos bancários. Para cada lançamento, classifique em uma das categorias: "
-    "Receita, Fornecedor, Impostos e Taxas, Folha de Pagamento, Despesa Operacional, "
-    "Transferência, ou Revisar (quando não tiver certeza). Retorne apenas um JSON "
-    "com array de objetos contendo: data, descricao, valor, categoria, confianca "
-    "(alta/media/baixa)."
+    "Você é um contador brasileiro sênior com 20 anos de experiência. "
+    "Analise cada lançamento e classifique com máxima precisão em UMA das seguintes "
+    "categorias, usando o nome da empresa, CNPJ e contexto para classificar:\n\n"
+    "- Receita: entradas de clientes, vendas, serviços prestados\n"
+    "- Transferência Pessoal: PIX/TED entre pessoas físicas conhecidas\n"
+    "- Fatura Cartão: pagamento de fatura de cartão de crédito\n"
+    "- Investimento: RDB, CDB, Tesouro Direto, ações, fundos, resgates\n"
+    "- Internet e Telecom: provedores internet, telefonia, streaming\n"
+    "- Apostas e Jogos: casas de aposta, jogos online (Betboom, Bet365, Betano, Sportingbet, etc.)\n"
+    "- Alimentação: restaurantes, delivery, supermercados, padarias\n"
+    "- Transporte: Uber, 99, combustível, pedágio, estacionamento\n"
+    "- Moradia: aluguel, condomínio, água, luz, gás\n"
+    "- Saúde: farmácias, planos de saúde, consultas médicas\n"
+    "- Serviço Financeiro: fintechs, corretoras, instituições de pagamento\n"
+    "- Impostos e Taxas: INSS, FGTS, IPTU, IPVA, DAS, IOF, tributos\n"
+    "- Folha de Pagamento: salários, pró-labore, benefícios\n"
+    "- Fornecedores: pagamentos a empresas por produtos ou serviços\n"
+    "- Outros: apenas se absolutamente impossível classificar\n\n"
+    "REGRAS:\n"
+    "- NUNCA classifique como Transferência apenas porque aparece PIX ou TED; analise o destinatário.\n"
+    "- Se for transferência entre pessoas físicas conhecidas: use Transferência Pessoal.\n"
+    "- Se o lançamento envolver Betboom, Bet365, Betano, Sportingbet ou casas de aposta: use Apostas e Jogos.\n"
+    "- Se envolver RDB, CDB, aplicação, resgate, Tesouro Direto, fundos ou ações: use Investimento.\n"
+    "- Se envolver Alares, Claro, Vivo, Tim, Oi ou provedores similares: use Internet e Telecom.\n"
+    "- Se for pagamento de fatura de cartão de crédito: use Fatura Cartão.\n"
+    "Classifique TODOS os lançamentos, sem omitir nenhum."
 )
 
 EXTRACTION_SYSTEM_PROMPT = (
@@ -285,6 +306,17 @@ def extract_text_from_pdf_with_pdfplumber(file_bytes: bytes) -> str:
     return "\n".join(texts)
 
 
+def extract_text_from_pdf_with_pymupdf(file_bytes: bytes) -> str:
+    """Extrai texto bruto de um PDF usando PyMuPDF (fitz)."""
+    texts: List[str] = []
+    with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+        for page in doc:
+            t = page.get_text("text")
+            if t:
+                texts.append(t)
+    return "\n".join(texts)
+
+
 def extract_transactions_with_openai_from_text(text: str) -> pd.DataFrame:
     """
     Usa o modelo da OpenAI para extrair lançamentos (data, descrição, valor)
@@ -445,34 +477,39 @@ def extract_transactions_with_openai_from_images(
     return df.reset_index(drop=True)
 
 
-def load_statement(uploaded_file) -> pd.DataFrame:
+def extrair_lancamentos(arquivo) -> pd.DataFrame:
     """
-    Detecta tipo do arquivo e delega para o parser apropriado.
+    Detecta automaticamente se o arquivo é PDF ou CSV e retorna sempre
+    um DataFrame com exatamente 3 colunas: data, descricao, valor.
 
-    Para PDF, aplica uma lógica em cascata:
-    1) Tenta extrair com pdfplumber
-    2) Se falhar, tenta com PyMuPDF (fitz)
-    3) Se ainda falhar, extrai o texto bruto e usa a OpenAI para identificar lançamentos
+    - CSV: testa separadores vírgula e ponto e vírgula, detecta automaticamente
+      colunas de data, valor e descrição independente do nome ou ordem.
+    - PDF com texto: usa pdfplumber; se extrair menos de 100 caracteres,
+      tenta PyMuPDF. O texto extraído é enviado para a OpenAI para extrair
+      os lançamentos em JSON.
+    - PDF com imagem: converte com pdf2image e envia para OpenAI Vision gpt-4o
+      para extrair lançamentos em JSON.
     """
-    if uploaded_file is None:
+    if arquivo is None:
         raise ValueError("Nenhum arquivo enviado.")
 
-    name = uploaded_file.name.lower()
+    name = (getattr(arquivo, "name", "") or "").lower()
+    file_bytes = arquivo.read()
+    if not file_bytes:
+        raise ValueError("Arquivo vazio.")
 
     # -----------------
     # Arquivos CSV
     # -----------------
     if name.endswith(".csv"):
-        file_bytes = uploaded_file.read()
-
-        # 1) Tenta ler com pandas usando diferentes separadores
+        # 1) Tenta ler com pandas usando diferentes separadores (vírgula e ponto e vírgula)
         def parse_csv_bytes(b: bytes) -> Optional[pd.DataFrame]:
             for encoding in ("utf-8", "latin-1"):
                 try:
                     text = b.decode(encoding)
                 except UnicodeDecodeError:
                     continue
-                for sep in [",", ";", "\t"]:
+                for sep in [",", ";"]:
                     try:
                         df_raw = pd.read_csv(io.StringIO(text), sep=sep)
                     except Exception:
@@ -484,59 +521,81 @@ def load_statement(uploaded_file) -> pd.DataFrame:
 
         df_csv = parse_csv_bytes(file_bytes)
         if df_csv is not None and not df_csv.empty:
-            return df_csv
+            df_out = df_csv
+        else:
+            # 2) Fallback: envia o conteúdo bruto do CSV para a OpenAI extrair os lançamentos
+            csv_text = ""
+            for encoding in ("utf-8", "latin-1"):
+                try:
+                    csv_text = file_bytes.decode(encoding)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if not csv_text:
+                raise ValueError(
+                    "Não foi possível decodificar o CSV nem extrair as colunas automaticamente."
+                )
 
-        # 2) Fallback: envia o conteúdo bruto do CSV para a OpenAI extrair os lançamentos
-        for encoding in ("utf-8", "latin-1"):
-            try:
-                csv_text = file_bytes.decode(encoding)
-                break
-            except UnicodeDecodeError:
-                csv_text = ""
-        if not csv_text:
-            raise ValueError(
-                "Não foi possível decodificar o CSV nem extrair as colunas automaticamente."
-            )
-
-        df_ai_csv = extract_transactions_with_openai_from_text(csv_text)
-        return df_ai_csv
+            df_out = extract_transactions_with_openai_from_text(csv_text)
 
     # -----------------
     # Arquivos PDF
     # -----------------
-    if name.endswith(".pdf"):
-        file_bytes = uploaded_file.read()
-
+    elif name.endswith(".pdf"):
         # 1) Tenta extrair texto com pdfplumber
         try:
             raw_text = extract_text_from_pdf_with_pdfplumber(file_bytes)
-        except Exception as e:
+        except Exception:
             raw_text = ""
 
-        if raw_text and len(raw_text) >= 100:
+        text_ok = raw_text.strip() if raw_text else ""
+
+        # 2) Se texto insuficiente, tenta PyMuPDF
+        if len(text_ok) < 100:
+            try:
+                raw_text_pymupdf = extract_text_from_pdf_with_pymupdf(file_bytes)
+            except Exception:
+                raw_text_pymupdf = ""
+
+            if len((raw_text_pymupdf or "").strip()) >= 100:
+                text_ok = raw_text_pymupdf.strip()
+
+        if text_ok and len(text_ok) >= 100:
             # Texto suficiente: usa OpenAI para extrair lançamentos do texto
-            df_ai_pdf_text = extract_transactions_with_openai_from_text(raw_text)
-            return df_ai_pdf_text
+            df_out = extract_transactions_with_openai_from_text(text_ok)
+        else:
+            # 3) Possível PDF baseado em imagem: usa pdf2image + OpenAI Vision
+            try:
+                images: List[Image.Image] = convert_from_bytes(file_bytes)
+            except Exception as e:
+                raise ValueError(
+                    "Não foi possível converter o PDF em imagens. "
+                    "Verifique se o arquivo está corrompido ou tente outro extrato."
+                ) from e
 
-        # 2) Possível PDF baseado em imagem: usa pdf2image + OpenAI Vision
-        try:
-            images: List[Image.Image] = convert_from_bytes(file_bytes)
-        except Exception as e:
-            raise ValueError(
-                "Não foi possível converter o PDF em imagens. "
-                "Verifique se o arquivo está corrompido ou tente outro extrato."
-            ) from e
+            if not images:
+                raise ValueError(
+                    "Nenhuma página de imagem foi gerada a partir do PDF. "
+                    "Não é possível extrair os lançamentos."
+                )
 
-        if not images:
-            raise ValueError(
-                "Nenhuma página de imagem foi gerada a partir do PDF. "
-                "Não é possível extrair os lançamentos."
-            )
+            df_out = extract_transactions_with_openai_from_images(images)
+    else:
+        raise ValueError("Tipo de arquivo não suportado. Use PDF ou CSV.")
 
-        df_ai_pdf_images = extract_transactions_with_openai_from_images(images)
-        return df_ai_pdf_images
+    if df_out is None or df_out.empty:
+        raise ValueError("Nenhum lançamento foi identificado no arquivo enviado.")
 
-    raise ValueError("Tipo de arquivo não suportado. Use PDF ou CSV.")
+    # Garante que o resultado tenha exatamente as 3 colunas esperadas,
+    # independente da origem (CSV ou PDF)
+    if not {"data", "descricao", "valor"}.issubset(df_out.columns):
+        raise ValueError(
+            "Os lançamentos extraídos não possuem as colunas esperadas: "
+            "data, descricao, valor."
+        )
+
+    df_final = df_out[["data", "descricao", "valor"]].copy()
+    return df_final.reset_index(drop=True)
 
 
 # -----------------------------------
@@ -572,76 +631,103 @@ def classify_transactions_with_openai(df: pd.DataFrame) -> pd.DataFrame:
 
     client = get_openai_client()
 
-    lancamentos = []
-    for _, row in df.iterrows():
-        lancamentos.append(
-            {
-                "data": row["data"],
-                "descricao": row["descricao"],
-                "valor": float(row["valor"]) if row["valor"] is not None else 0.0,
-            }
-        )
+    total = len(df)
+    batch_size = 20
 
-    payload = {"lancamentos": lancamentos}
-
-    user_prompt = (
-        "Classifique os seguintes lançamentos bancários conforme o prompt de sistema.\n"
-        "IMPORTANTE: retorne SOMENTE um JSON no formato:\n"
-        '{"lancamentos": [{"data": "...", "descricao": "...", "valor": 0.0, '
-        '"categoria": "...", "confianca": "alta|media|baixa"}, ...]}\n\n'
-        "Aqui estão os lançamentos em JSON:\n"
-        f"{json.dumps(payload, ensure_ascii=False)}"
-    )
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0,
-    )
-
-    content = response.choices[0].message.content
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError:
-        raise ValueError("A resposta da OpenAI não pôde ser interpretada como JSON.")
-
-    # Aceita tanto {"lancamentos": [...]} quanto um array direto por segurança
-    lancamentos_resp = data.get("lancamentos", data)
-    if not isinstance(lancamentos_resp, list):
-        raise ValueError("O JSON retornado não contém um array de lançamentos válido.")
+    progress_bar = st.progress(0)
+    status_text = st.empty()
 
     result_rows: List[Dict] = []
-    for item in lancamentos_resp:
-        categoria = str(item.get("categoria", "")).strip()
-        confianca_raw = str(item.get("confianca", "")).strip().lower()
 
-        # Normaliza confiança para Alta / Média / Baixa
-        if "alta" in confianca_raw:
-            confianca = "Alta"
-        elif "med" in confianca_raw or "méd" in confianca_raw:
-            confianca = "Média"
-        elif "baix" in confianca_raw:
-            confianca = "Baixa"
-        else:
-            confianca = "Baixa"
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        batch_df = df.iloc[start:end]
 
-        # Se confiança for baixa e categoria não for Revisar, força categoria Revisar
-        if confianca == "Baixa" and categoria.lower() != "revisar":
-            categoria = "Revisar"
-
-        result_rows.append(
-            {
-                "data": item.get("data"),
-                "descricao": item.get("descricao"),
-                "valor": item.get("valor"),
-                "categoria": categoria,
-                "confianca": confianca,
-            }
+        status_text.text(
+            f"Classificando lançamentos {start + 1}-{end} de {total}..."
         )
+        progress_bar.progress(int((end / total) * 100))
+
+        lancamentos_batch = []
+        for _, row in batch_df.iterrows():
+            lancamentos_batch.append(
+                {
+                    "data": row["data"],
+                    "descricao": row["descricao"],
+                    "valor": float(row["valor"])
+                    if row["valor"] is not None
+                    else 0.0,
+                }
+            )
+
+        user_prompt = (
+            "Classifique os lançamentos bancários a seguir conforme o prompt de sistema.\n"
+            "Retorne APENAS JSON válido, sem texto extra nem markdown, no formato:\n"
+            "[{"
+            "data, descricao, valor, categoria, "
+            "confianca: alta|media|baixa, motivo: explicação curta"
+            "}]\n\n"
+            "Processa todos os lançamentos sem omitir nenhum.\n\n"
+            "Lançamentos em JSON:\n"
+            f"{json.dumps(lancamentos_batch, ensure_ascii=False)}"
+        )
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0,
+        )
+
+        content = response.choices[0].message.content
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            raise ValueError(
+                "A resposta da OpenAI não pôde ser interpretada como JSON válido."
+            )
+
+        # Aceita tanto um array direto quanto um objeto com chave 'lancamentos'
+        if isinstance(data, dict):
+            lancamentos_resp = data.get("lancamentos")
+        else:
+            lancamentos_resp = data
+
+        if not isinstance(lancamentos_resp, list):
+            raise ValueError(
+                "O JSON retornado pela OpenAI não contém uma lista de lançamentos válida."
+            )
+
+        for item in lancamentos_resp:
+            categoria = str(item.get("categoria", "")).strip()
+            confianca_raw = str(item.get("confianca", "")).strip().lower()
+            motivo = str(item.get("motivo", "")).strip()
+
+            # Normaliza confiança para Alta / Média / Baixa
+            if "alta" in confianca_raw:
+                confianca = "Alta"
+            elif "med" in confianca_raw or "méd" in confianca_raw:
+                confianca = "Média"
+            elif "baix" in confianca_raw:
+                confianca = "Baixa"
+            else:
+                confianca = "Baixa"
+
+            result_rows.append(
+                {
+                    "data": item.get("data"),
+                    "descricao": item.get("descricao"),
+                    "valor": item.get("valor"),
+                    "categoria": categoria,
+                    "confianca": confianca,
+                    "motivo": motivo,
+                }
+            )
+
+    progress_bar.progress(100)
+    status_text.empty()
 
     result_df = pd.DataFrame(result_rows)
     return result_df
@@ -752,7 +838,7 @@ def main():
         try:
             progress = progress_placeholder.progress(10)
             with st.spinner("Lendo e analisando o extrato..."):
-                df = load_statement(uploaded_file)
+                df = extrair_lancamentos(uploaded_file)
                 progress.progress(40)
             st.session_state.raw_df = df
             st.session_state.classified_df = None
@@ -775,7 +861,6 @@ def main():
 
         # Classifica automaticamente assim que os dados forem carregados
         if st.session_state.classified_df is None:
-            progress = progress_placeholder.progress(60)
             with st.spinner("Classificando lançamentos com IA..."):
                 try:
                     classified_df = classify_transactions_with_openai(
@@ -783,11 +868,8 @@ def main():
                     )
                     st.session_state.classified_df = classified_df
                     st.session_state.edited_df = classified_df.copy()
-                    progress.progress(100)
-                    progress_placeholder.empty()
                     st.success("Classificação concluída com sucesso!")
                 except Exception as e:
-                    progress_placeholder.empty()
                     st.error(f"Erro ao classificar lançamentos: {e}")
 
     # ---------------------------------
