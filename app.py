@@ -586,22 +586,44 @@ def compute_movimentacao_liquida(df: pd.DataFrame) -> dict:
     # O titular é o nome que aparece mais vezes como remetente/destinatário nas transferências
     # Além disso usa o nome informado pelo usuário se disponível
     titular_nome = st.session_state.get("titular_nome", "").upper().strip()
-    
-    if titular_nome:
-        mask_propria = desc.str.contains(titular_nome, regex=False, na=False)
-    else:
-        # Fallback: detecta automaticamente nomes que aparecem tanto como remetente quanto destinatário
-        # Pega todos os nomes únicos das transferências
-        nomes_enviados = desc[desc.str.contains("ENVIADA|ENVIADO", na=False)].str.extract(r"PIX\s+(.+?)\s+-\s+", expand=False).dropna()
-        nomes_recebidos = desc[desc.str.contains("RECEBIDA|RECEBIDO", na=False)].str.extract(r"PIX\s+(.+?)\s+-\s+", expand=False).dropna()
-        nomes_comuns = set(nomes_enviados.str.upper().tolist()) & set(nomes_recebidos.str.upper().tolist())
-        
-        if nomes_comuns:
-            # Usa o nome que aparece em ambos os lados (enviado e recebido) = titular
-            pattern = "|".join([re.escape(n) for n in nomes_comuns])
-            mask_propria = desc.str.contains(pattern, regex=True, na=False)
+
+    def _build_propria_mask(desc_series, nome):
+        """
+        Marca como própria SOMENTE quando o nome do titular aparece
+        IMEDIATAMENTE após 'Pix' na descrição — ou seja, é o destinatário/
+        remetente principal, não apenas mencionado como contexto de conta.
+        Padrão Nubank: 'Transferência enviada pelo Pix NOME TITULAR - CPF - BANCO'
+        """
+        if not nome:
+            return pd.Series([False] * len(desc_series), index=desc_series.index)
+        partes = nome.split()
+        # Aceita também nome abreviado: VICTOR S M MEDEIROS
+        if len(partes) >= 4:
+            nome_curto = f"{partes[0]} {partes[1][0]} {partes[2][0]} {partes[-1]}"
         else:
-            # Sem detecção automática possível
+            nome_curto = nome
+        pattern = r"PIX[\s\-]+" + "(" + re.escape(nome) + "|" + re.escape(nome_curto) + ")"
+        return desc_series.str.contains(pattern, regex=True, na=False)
+
+    if titular_nome:
+        mask_propria = _build_propria_mask(desc, titular_nome)
+    else:
+        # Fallback: detecta automaticamente nomes que aparecem em ambos os lados (enviado e recebido)
+        nomes_enviados = set(
+            desc[desc.str.contains(r"ENVIADA|ENVIADO", na=False)]
+            .str.extract(r"PIX[\s\-]+([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-ZÁÉÍÓÚÂÊÔÃÕÇ\s]+?)[\s\-]+[•\d]", expand=False)
+            .dropna().str.upper().tolist()
+        )
+        nomes_recebidos = set(
+            desc[desc.str.contains(r"RECEBIDA|RECEBIDO", na=False)]
+            .str.extract(r"PIX[\s\-]+([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-ZÁÉÍÓÚÂÊÔÃÕÇ\s]+?)[\s\-]+[•\d]", expand=False)
+            .dropna().str.upper().tolist()
+        )
+        nomes_comuns = {n.strip() for n in nomes_enviados & nomes_recebidos if len(n.strip()) > 5}
+        if nomes_comuns:
+            titular_auto = max(nomes_comuns, key=len)
+            mask_propria = _build_propria_mask(desc, titular_auto)
+        else:
             mask_propria = pd.Series([False] * len(df), index=df.index)
     df_propria = df[mask_propria]
     total_saida_propria = df_propria[df_propria["valor"] < 0]["valor"].sum()
