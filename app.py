@@ -84,15 +84,16 @@ SYSTEM_PROMPT = (
 )
 
 EXTRACTION_SYSTEM_PROMPT = (
-    "Você é um assistente contábil brasileiro especializado em extrair "
-    "lançamentos bancários de textos de extratos de bancos brasileiros "
-    "(Nubank, Itaú, Bradesco, Santander, Banco do Brasil, Caixa, etc.). "
-    "Sua tarefa é identificar todos os lançamentos contendo: data, descrição "
-    "e valor (positivo para créditos, negativo para débitos). "
-    "NÃO inclua linhas de totais, cabeçalhos ou rodapés — apenas lançamentos individuais. "
-    "Retorne apenas um JSON com o campo 'lancamentos', que é um array de objetos "
-    'no formato: {"data": "DD/MM/YYYY", "descricao": "...", "valor": 0.0}. '
-    "O valor deve ser um número decimal positivo para crédito e negativo para débito."
+    "Você é um assistente contábil brasileiro especializado em extrair lançamentos bancários "
+    "de extratos de bancos brasileiros (Nubank, Itaú, Bradesco, Santander, Banco do Brasil, Caixa, etc.).\n\n"
+    "REGRAS CRÍTICAS:\n"
+    "1. Extraia ABSOLUTAMENTE TODOS os lançamentos individuais — nunca pule nenhum.\n"
+    "2. Múltiplos lançamentos no mesmo dia devem ser extraídos separadamente. "
+    "Ex: dois 'Resgate RDB' no mesmo dia = DOIS registros distintos.\n"
+    "3. NUNCA agrupe lançamentos do mesmo dia.\n"
+    "4. IGNORE apenas: cabeçalhos, rodapés, Total de entradas, Total de saídas, Saldo inicial, Saldo final.\n"
+    "5. Retorne APENAS JSON: "
+    '[{"data": "DD/MM/YYYY", "descricao": "...", "valor": 0.0}]'
 )
 
 
@@ -272,12 +273,14 @@ def extract_transactions_with_openai_from_text(text: str) -> pd.DataFrame:
     max_chars = 50000
     trimmed_text = text[:max_chars]
     user_prompt = (
-        "A seguir está o conteúdo de um extrato bancário brasileiro. "
-        "Identifique TODOS os lançamentos individuais (não inclua totais, cabeçalhos ou rodapés). "
-        "Para cada lançamento extraia: data, descrição e valor (positivo=crédito, negativo=débito). "
-        "Retorne SOMENTE JSON no formato:\n"
-        '{"lancamentos": [{"data": "DD/MM/YYYY", "descricao": "...", "valor": 0.0}]}\n\n'
-        f"Conteúdo:\n{trimmed_text}"
+        "Extrato bancário brasileiro abaixo. Extraia TODOS os lançamentos sem excecão.\n\n"
+        "CRÍTICO: múltiplos lançamentos no mesmo dia devem ser extraídos individualmente. "
+        "Ex: dois Resgate RDB no mesmo dia = DOIS registros. "
+        "Ignore APENAS totais de dia, saldo inicial/final e cabeçalhos.\n"
+        "Valor: positivo=crédito, negativo=débito.\n\n"
+        "Retorne SOMENTE JSON:\n"
+        '{"lancamentos": [{"data": "DD/MM/YYYY", "descricao": "descricao completa", "valor": 0.0}]}\n\n'
+        f"Extrato:\n{trimmed_text}"
     )
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -579,11 +582,27 @@ def compute_movimentacao_liquida(df: pd.DataFrame) -> dict:
     desc = df["descricao"].str.upper() if "descricao" in df.columns else pd.Series([], dtype=str)
     valor = df["valor"] if "valor" in df.columns else pd.Series([], dtype=float)
 
-    # Transferências próprias (mesmo CPF/nome do titular)
-    mask_propria = desc.str.contains(
-        r"VICTOR SAMUEL MATIAS MEDEIROS|VICTOR S M MEDEIROS|VICTOR S\. M\. MEDEIROS",
-        regex=True, na=False
-    )
+    # Transferências próprias - detecta o titular automaticamente
+    # O titular é o nome que aparece mais vezes como remetente/destinatário nas transferências
+    # Além disso usa o nome informado pelo usuário se disponível
+    titular_nome = st.session_state.get("titular_nome", "").upper().strip()
+    
+    if titular_nome:
+        mask_propria = desc.str.contains(titular_nome, regex=False, na=False)
+    else:
+        # Fallback: detecta automaticamente nomes que aparecem tanto como remetente quanto destinatário
+        # Pega todos os nomes únicos das transferências
+        nomes_enviados = desc[desc.str.contains("ENVIADA|ENVIADO", na=False)].str.extract(r"PIX\s+(.+?)\s+-\s+", expand=False).dropna()
+        nomes_recebidos = desc[desc.str.contains("RECEBIDA|RECEBIDO", na=False)].str.extract(r"PIX\s+(.+?)\s+-\s+", expand=False).dropna()
+        nomes_comuns = set(nomes_enviados.str.upper().tolist()) & set(nomes_recebidos.str.upper().tolist())
+        
+        if nomes_comuns:
+            # Usa o nome que aparece em ambos os lados (enviado e recebido) = titular
+            pattern = "|".join([re.escape(n) for n in nomes_comuns])
+            mask_propria = desc.str.contains(pattern, regex=True, na=False)
+        else:
+            # Sem detecção automática possível
+            mask_propria = pd.Series([False] * len(df), index=df.index)
     df_propria = df[mask_propria]
     total_saida_propria = df_propria[df_propria["valor"] < 0]["valor"].sum()
     total_entrada_propria = df_propria[df_propria["valor"] > 0]["valor"].sum()
@@ -594,6 +613,9 @@ def compute_movimentacao_liquida(df: pd.DataFrame) -> dict:
     total_aplicado = df_inv[df_inv["valor"] < 0]["valor"].sum()
     total_resgatado = df_inv[df_inv["valor"] > 0]["valor"].sum()
     net_investimento = df_inv["valor"].sum()
+    # Net líquido: quanto efetivamente entrou ou saiu do bolso em investimentos
+    # Se aplicou 9k e resgatou 18k, net = +9k (resgate líquido de 9k)
+    # Se aplicou 9k e resgatou 1k, net = -8k (ainda tem 8k investido)
 
     # Apostas
     mask_aposta = desc.str.contains(r"BETBOOM|BET365|BETANO|SPORTINGBET|PAY4FUN|OKTO IP", regex=True, na=False)
@@ -644,15 +666,25 @@ def render_movimentacao_liquida(df: pd.DataFrame):
 
     with col2:
         st.markdown("**📈 Investimentos (RDB/CDB)**")
-        st.caption("Ciclos de aplicação e resgate — o dinheiro não saiu de fato")
-        st.metric("Total aplicado", format_brl(abs(dados["aplicado"])))
-        st.metric("Total resgatado", format_brl(dados["resgatado"]))
+        st.caption("Saldo líquido: quanto efetivamente entrou ou saiu do bolso em investimentos")
         net = dados["net_investimento"]
-        st.metric(
-            "Saldo líquido de investimentos",
-            format_brl(abs(net)),
-            delta="Resgate líquido" if net > 0 else "Aplicação líquida",
-        )
+        st.metric("Total bruto aplicado", format_brl(abs(dados["aplicado"])))
+        st.metric("Total bruto resgatado", format_brl(dados["resgatado"]))
+        if net > 0:
+            st.metric(
+                "Resgate líquido (ganho real)",
+                format_brl(net),
+                help="Você resgatou mais do que aplicou neste período — esse é o dinheiro que efetivamente voltou para o caixa"
+            )
+        elif net < 0:
+            st.metric(
+                "Aplicação líquida (dinheiro imobilizado)",
+                format_brl(abs(net)),
+                help="Você aplicou mais do que resgatou — esse dinheiro está rendendo investido"
+            )
+        else:
+            st.metric("Saldo líquido de investimentos", "R$ 0,00",
+                help="Tudo que aplicou foi resgatado no período")
 
     with col3:
         st.markdown("**💰 Fluxo de caixa real**")
@@ -764,6 +796,15 @@ def main():
     # Barra lateral
     st.sidebar.title("ConciBot 🧾")
     st.sidebar.caption("Classificação inteligente de extratos bancários")
+    
+    titular_input = st.sidebar.text_input(
+        "Nome do titular da conta",
+        placeholder="Ex: João Silva",
+        help="Informe o nome do titular para identificar transferências entre contas próprias com precisão"
+    )
+    if titular_input:
+        st.session_state["titular_nome"] = titular_input.upper().strip()
+    
     uploaded_file = st.sidebar.file_uploader(
         "Faça upload do seu extrato bancário em PDF ou CSV",
         type=["pdf", "csv"]
