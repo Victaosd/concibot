@@ -565,6 +565,113 @@ def export_to_excel(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
+def compute_movimentacao_liquida(df: pd.DataFrame) -> dict:
+    """
+    Calcula a movimentação líquida real separando:
+    - Transferências próprias (mesmo titular)
+    - Investimentos (aplicações e resgates RDB/CDB)
+    - Apostas
+    - Fluxo real de caixa (excluindo internos)
+    """
+    if df is None or df.empty:
+        return {}
+
+    desc = df["descricao"].str.upper() if "descricao" in df.columns else pd.Series([], dtype=str)
+    valor = df["valor"] if "valor" in df.columns else pd.Series([], dtype=float)
+
+    # Transferências próprias (mesmo CPF/nome do titular)
+    mask_propria = desc.str.contains(
+        r"VICTOR SAMUEL MATIAS MEDEIROS|VICTOR S M MEDEIROS|VICTOR S\. M\. MEDEIROS",
+        regex=True, na=False
+    )
+    df_propria = df[mask_propria]
+    total_saida_propria = df_propria[df_propria["valor"] < 0]["valor"].sum()
+    total_entrada_propria = df_propria[df_propria["valor"] > 0]["valor"].sum()
+
+    # Investimentos
+    mask_inv = desc.str.contains(r"RDB|CDB|APLICAÇÃO|APLICACAO|RESGATE|TESOURO|FUNDO", regex=True, na=False)
+    df_inv = df[mask_inv]
+    total_aplicado = df_inv[df_inv["valor"] < 0]["valor"].sum()
+    total_resgatado = df_inv[df_inv["valor"] > 0]["valor"].sum()
+    net_investimento = df_inv["valor"].sum()
+
+    # Apostas
+    mask_aposta = desc.str.contains(r"BETBOOM|BET365|BETANO|SPORTINGBET|PAY4FUN|OKTO IP", regex=True, na=False)
+    df_aposta = df[mask_aposta]
+    total_apostas = df_aposta["valor"].abs().sum()
+
+    # Fluxo real = exclui transferências próprias e ciclos de investimento
+    mask_interno = mask_propria | mask_inv
+    df_externo = df[~mask_interno]
+    receita_real = df_externo[df_externo["valor"] > 0]["valor"].sum()
+    despesa_real = df_externo[df_externo["valor"] < 0]["valor"].sum()
+
+    return {
+        "propria_saida": float(total_saida_propria),
+        "propria_entrada": float(total_entrada_propria),
+        "propria_count": int(len(df_propria)),
+        "aplicado": float(total_aplicado),
+        "resgatado": float(total_resgatado),
+        "net_investimento": float(net_investimento),
+        "total_apostas": float(total_apostas),
+        "apostas_count": int(len(df_aposta)),
+        "receita_real": float(receita_real),
+        "despesa_real": float(despesa_real),
+        "saldo_real": float(receita_real + despesa_real),
+    }
+
+
+def render_movimentacao_liquida(df: pd.DataFrame):
+    """Renderiza o card de movimentação líquida na interface."""
+    dados = compute_movimentacao_liquida(df)
+    if not dados:
+        return
+
+    st.markdown("### 🔍 Movimentação Líquida Real")
+    st.caption(
+        "Desconta transferências entre suas próprias contas e ciclos de investimento "
+        "para mostrar o fluxo de caixa real do período."
+    )
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.markdown("**💸 Transferências próprias**")
+        st.caption("Dinheiro circulando entre suas contas — não é receita nem despesa real")
+        st.metric("Saídas para contas próprias", format_brl(abs(dados["propria_saida"])))
+        st.metric("Entradas de contas próprias", format_brl(dados["propria_entrada"]))
+        st.metric("Lançamentos internos", f"{dados['propria_count']}")
+
+    with col2:
+        st.markdown("**📈 Investimentos (RDB/CDB)**")
+        st.caption("Ciclos de aplicação e resgate — o dinheiro não saiu de fato")
+        st.metric("Total aplicado", format_brl(abs(dados["aplicado"])))
+        st.metric("Total resgatado", format_brl(dados["resgatado"]))
+        net = dados["net_investimento"]
+        st.metric(
+            "Saldo líquido de investimentos",
+            format_brl(abs(net)),
+            delta="Resgate líquido" if net > 0 else "Aplicação líquida",
+        )
+
+    with col3:
+        st.markdown("**💰 Fluxo de caixa real**")
+        st.caption("Receitas e despesas reais excluindo movimentações internas")
+        st.metric("Receita real", format_brl(dados["receita_real"]))
+        st.metric("Despesa real", format_brl(abs(dados["despesa_real"])))
+        saldo_real = dados["saldo_real"]
+        st.metric(
+            "Saldo real do período",
+            format_brl(saldo_real),
+        )
+
+    if dados["apostas_count"] > 0:
+        st.error(
+            f"🎲 **Apostas detectadas:** {dados['apostas_count']} lançamento(s) "
+            f"totalizando **{format_brl(dados['total_apostas'])}** gastos em casas de apostas."
+        )
+
+
 def plot_charts(df: pd.DataFrame):
     if df.empty or "categoria" not in df.columns:
         return
@@ -828,6 +935,11 @@ def main():
         st.markdown("### 📈 Gráficos")
         final_df = st.session_state.edited_df if st.session_state.edited_df is not None else current_df
         plot_charts(final_df)
+
+        st.divider()
+
+        # Movimentação líquida real
+        render_movimentacao_liquida(final_df)
 
         st.divider()
 
